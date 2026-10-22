@@ -67,6 +67,8 @@ _bank_lock = threading.Lock()
 _pool = []          # list of dicts: token, balance, dead, cooldown_until, dead_probes, next_probe
 _pool_mtime = 0.0
 _used = {}          # (quota-day, token) -> free requests used today
+_busy = set()       # tokens with a text request in flight
+_lat = {}           # token -> EWMA latency of successful text requests, seconds
 _stats = {'requests': 0, 'ok': 0, 'fail': 0, 'free_hits': 0, 'coin_spend': 0.0}
 FREE_DAILY = 5      # upstream: 5 free text requests / account / day (reset 21:00 UTC)
 
@@ -142,6 +144,9 @@ def pick(kind='text', skip=(), need=0.0):
     with _lock:
         cand = [a for a in _pool if not a['dead'] and a['cooldown_until'] <= now
                 and a['token'] not in skip]
+        busy = [a for a in cand if a['token'] in _busy]
+        if busy and len(busy) < len(cand):
+            cand = [a for a in cand if a['token'] not in _busy]
         if not cand:
             return None
         if kind == 'text':
@@ -153,6 +158,9 @@ def pick(kind='text', skip=(), need=0.0):
             cand = [a for a in cand if a['balance'] >= need]
             if not cand:
                 return None
+        if kind == 'text':
+            cand.sort(key=lambda a: (_lat.get(a['token'], 10.0), -a['balance']))
+            return cand[0]
         cand.sort(key=lambda a: -a['balance'])
         return random.choice(cand[:4])
 
@@ -403,6 +411,7 @@ def do_text(model, prompt, tries=6, fallbacks=None):
             return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err,
                                    'type': 'upstream_unavailable'}}
         skip.add(acc['token'])
+        _busy.add(acc['token'])
         fields = {
             'prompt': prompt, 'model': model,
             'response_format': 'text', 'response_length': 'medium', 'persona': 'universal',
@@ -411,8 +420,9 @@ def do_text(model, prompt, tries=6, fallbacks=None):
             'serial_session_id': '', 'serial_operation_id': '', 'serial_series_index': '0',
             'studio_chat_id': '', 'client_request_id': uuid.uuid4().hex,
         }
+        t0 = time.time()
         try:
-            st, raw = post_form('/api/miniapp/text/generate', acc['token'], fields)
+            st, raw = post_form('/api/miniapp/text/generate', acc['token'], fields, timeout=90)
             d = json.loads(raw)
             if not d.get('ok'):
                 last_err = str(d)[:200]
@@ -442,6 +452,10 @@ def do_text(model, prompt, tries=6, fallbacks=None):
                     # quota was spent upstream before our restart: don't
                     # keep preferring this account as "free" today
                     _used[(_today(), acc['token'])] = FREE_DAILY
+                dt = time.time() - t0
+                _lat[acc['token']] = 0.7 * _lat.get(acc['token'], 10.0) + 0.3 * dt
+            print('[pg_shim] text ok %s in %.1fs (prompt %d chars)'
+                  % (acc.get('email'), dt, len(prompt)), file=sys.stderr)
             return 200, d
         except urllib.error.HTTPError as e:
             body = b''
@@ -473,7 +487,10 @@ def do_text(model, prompt, tries=6, fallbacks=None):
                     mark_dead(acc)
         except Exception as e:
             last_err = repr(e)[:200]
-            mark_cooldown(acc, 30)
+            slow = isinstance(e, (TimeoutError, urllib.error.URLError))
+            mark_cooldown(acc, 600 if slow else 60)
+        finally:
+            _busy.discard(acc['token'])
     with _lock:
         _stats['fail'] += 1
     return 502, {'error': {'message': 'pg_shim: all retries failed: %s' % last_err,
@@ -732,9 +749,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {'error': {'message': 'empty messages'}})
                 return
             fallback = messages_to_prompt(messages, include_system=False)
-            sanitized = sanitize_prompt(fallback)
+            sanitized = sanitize_prompt(prompt)
+            sanitized_nosys = sanitize_prompt(fallback)
             tail = messages_to_prompt(messages, include_system=False, max_chars=60000)
-            st, d = do_text(model, prompt, fallbacks=[fallback, sanitized, tail])
+            st, d = do_text(model, prompt, fallbacks=[sanitized, fallback, sanitized_nosys, tail])
             if st != 200:
                 self._send(st, d)
                 return
