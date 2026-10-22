@@ -7,7 +7,9 @@ Endpoints:
   POST /v1/chat/completions   (stream + non-stream; tools ignored, plain text upstream)
   POST /v1/images/generations (Nano Banana 2 / GPT Image 2.5 / Seedream 5 ...)
   GET  /health
-Env: PG_BANK (path, default ./master_bank.jsonl), PG_PORT (default 8797).
+Env: PG_BANK (path, default ./master_bank.jsonl), PG_PORT (default 8797),
+     PG_AUTOFARM (1/0, default 1), PG_AUTOFARM_MIN_FREE (default 5),
+     PG_AUTOFARM_BATCH (default 1), PG_AUTOFARM_INTERVAL (sec, default 120).
 Stdlib only. Python 3.9+.
 """
 import json
@@ -28,6 +30,10 @@ UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 
 
 BANK_PATH = os.environ.get('PG_BANK', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'master_bank.jsonl'))
 PORT = int(os.environ.get('PG_PORT', '8797'))
+AUTOFARM = os.environ.get('PG_AUTOFARM', '1') != '0'
+AUTOFARM_MIN_FREE = int(os.environ.get('PG_AUTOFARM_MIN_FREE', '5'))
+AUTOFARM_BATCH = int(os.environ.get('PG_AUTOFARM_BATCH', '1'))
+AUTOFARM_INTERVAL = int(os.environ.get('PG_AUTOFARM_INTERVAL', '120'))
 
 TEXT_MODELS = [
     'gpt-6-astra', 'claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1',
@@ -51,7 +57,8 @@ FREE_DAILY = 5      # upstream: 5 free text requests / account / day (reset 21:0
 
 
 def _today():
-    return time.strftime('%Y-%m-%d', time.gmtime())
+    # free quota day boundary is 21:00 UTC (00:00 MSK), not UTC midnight
+    return time.strftime('%Y-%m-%d', time.gmtime(time.time() + 3 * 3600))
 
 
 def free_left(acc):
@@ -87,6 +94,13 @@ def load_pool():
         return
     if rows:
         with _lock:
+            old = {a['token']: a for a in _pool}
+            for r in rows:
+                o = old.get(r['token'])
+                if o is not None:
+                    # keep quarantine state across bank reloads
+                    r['dead'] = o['dead']
+                    r['cooldown_until'] = o['cooldown_until']
             _pool = rows
         _pool_mtime = mt
 
@@ -153,6 +167,45 @@ def _reaper():
                 time.sleep(1.5)
         except Exception:
             pass
+
+
+def _autofarm():
+    """Auto-provision: when the pool's remaining free text quota drops below
+    AUTOFARM_MIN_FREE, register AUTOFARM_BATCH fresh accounts via pg_farm
+    (mail.tm, ~1 account/min). Backs off on mail.tm rate-limit failures."""
+    try:
+        import pg_farm
+    except Exception as e:
+        print('[pg_shim] autofarm disabled: %r' % (e,), flush=True)
+        return
+    pg_farm.BANK = BANK_PATH
+    backoff = 0
+    while True:
+        time.sleep(max(AUTOFARM_INTERVAL, backoff))
+        backoff = 0
+        try:
+            load_pool()
+            with _lock:
+                alive = [a for a in _pool if not a['dead']]
+                left = sum(free_left(a) for a in alive)
+            if left >= AUTOFARM_MIN_FREE:
+                continue
+            print('[pg_shim] autofarm: free_left=%d < %d, farming %d'
+                  % (left, AUTOFARM_MIN_FREE, AUTOFARM_BATCH), flush=True)
+            for _ in range(AUTOFARM_BATCH):
+                r = pg_farm.farm_one()
+                if r.get('status') == 'ok':
+                    print('[pg_shim] autofarm: +%s bal=%s'
+                          % (r.get('email'), r.get('balance')), flush=True)
+                else:
+                    print('[pg_shim] autofarm fail: %s' % str(r)[:200], flush=True)
+                    if r.get('err') == '429' or r.get('status') == 'mail_fail':
+                        backoff = 600
+                        break
+                time.sleep(random.uniform(2, 5))
+        except Exception as e:
+            print('[pg_shim] autofarm error: %r' % (e,), flush=True)
+            backoff = 120
 
 
 def post_form(path, token, fields, timeout=240):
@@ -375,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, fmt, *args):
-        sys.stderr.write('[pg_shim] %s\n' % (fmt % args))
+        sys.stderr.write('[pg_shim %s] %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), fmt % args))
 
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
@@ -489,6 +542,8 @@ def main():
     load_pool()
     print('[pg_shim] bank=%s accounts=%d port=%d' % (BANK_PATH, len(_pool), PORT))
     threading.Thread(target=_reaper, daemon=True).start()
+    if AUTOFARM:
+        threading.Thread(target=_autofarm, daemon=True).start()
     srv = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     srv.daemon_threads = True
     srv.serve_forever()
