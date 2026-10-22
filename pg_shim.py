@@ -354,6 +354,7 @@ def messages_to_prompt(messages):
 def do_text(model, prompt, tries=6):
     skip = set()
     last_err = None
+    mod_hits = 0
     for i in range(tries):
         acc = pick('text', skip, need=1.0)
         if acc is None:
@@ -373,6 +374,13 @@ def do_text(model, prompt, tries=6):
             d = json.loads(raw)
             if not d.get('ok'):
                 last_err = str(d)[:200]
+                if 'moderation' in last_err.lower():
+                    mod_hits += 1
+                    if mod_hits >= 2:
+                        with _lock:
+                            _stats['fail'] += 1
+                        return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
+                                               'type': 'moderation_error'}}
                 continue
             with _lock:
                 acc['balance'] = float(d.get('remaining_coins', acc['balance']))
@@ -399,9 +407,16 @@ def do_text(model, prompt, tries=6):
             elif e.code == 429:
                 mark_cooldown(acc, 120)
             elif e.code in (402, 400):
-                if b'coin' in body.lower() or b'\xd0\xb1\xd0\xb0\xd0\xbb' in body.lower() or b'moderation' in body.lower():
-                    if b'moderation' in body.lower():
-                        continue  # prompt-level false positive: try another token once
+                low = body.lower()
+                if b'moderation' in low:
+                    mod_hits += 1
+                    if mod_hits >= 2:
+                        with _lock:
+                            _stats['fail'] += 1
+                        return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
+                                               'type': 'moderation_error'}}
+                    continue  # one false positive is possible: try another token
+                if b'coin' in low or b'\xd0\xb1\xd0\xb0\xd0\xbb' in low:
                     mark_dead(acc)
         except Exception as e:
             last_err = repr(e)[:200]
