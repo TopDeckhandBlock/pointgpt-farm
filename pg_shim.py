@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib.error
@@ -70,7 +71,15 @@ _used = {}          # (quota-day, token) -> free requests used today
 _busy = set()       # tokens with a text request in flight
 _lat = {}           # token -> EWMA latency of successful text requests, seconds
 _stats = {'requests': 0, 'ok': 0, 'fail': 0, 'free_hits': 0, 'coin_spend': 0.0}
+_events = deque(maxlen=80)
+_events_lock = threading.Lock()
+STARTED = time.time()
 FREE_DAILY = 5      # upstream: 5 free text requests / account / day (reset 21:00 UTC)
+
+
+def event(msg):
+    with _events_lock:
+        _events.appendleft({'t': time.time(), 'msg': msg})
 
 
 def video_cost(model, duration):
@@ -226,6 +235,7 @@ def _reaper():
                 if ok:
                     print('[pg_shim] revived %s balance=%.1f'
                           % (acc['email'], acc['balance']), flush=True)
+                    event('revived %s (balance %.1f)' % (acc['email'], acc['balance']))
                 else:
                     print('[pg_shim] probe failed %s, next in %ds'
                           % (acc['email'], int(acc['next_probe'] - time.time())), flush=True)
@@ -312,8 +322,10 @@ def _autofarm():
                 if r.get('status') == 'ok':
                     print('[pg_shim] autofarm: +%s bal=%s'
                           % (r.get('email'), r.get('balance')), flush=True)
+                    event('autofarm +%s (balance %s)' % (r.get('email'), r.get('balance')))
                 else:
                     print('[pg_shim] autofarm fail: %s' % str(r)[:200], flush=True)
+                    event('autofarm failed: %s' % str(r)[:80])
                     if r.get('err') == '429' or r.get('status') == 'mail_fail':
                         backoff = 600
                         break
@@ -434,6 +446,8 @@ def do_text(model, prompt, tries=6, fallbacks=None):
                         prompt = variants[idx]
                         print('[pg_shim] moderation hit: fallback %d/%d (prompt %d chars)'
                               % (idx, len(variants) - 1, len(prompt)), file=sys.stderr)
+                        event('moderation: retry %d/%d without system/stack traces'
+                              % (idx, len(variants) - 1))
                         continue
                     with _lock:
                         _stats['fail'] += 1
@@ -456,6 +470,7 @@ def do_text(model, prompt, tries=6, fallbacks=None):
                 _lat[acc['token']] = 0.7 * _lat.get(acc['token'], 10.0) + 0.3 * dt
             print('[pg_shim] text ok %s in %.1fs (prompt %d chars)'
                   % (acc.get('email'), dt, len(prompt)), file=sys.stderr)
+            event('text ok %s in %.1fs' % (acc.get('email'), dt))
             return 200, d
         except urllib.error.HTTPError as e:
             body = b''
@@ -478,6 +493,8 @@ def do_text(model, prompt, tries=6, fallbacks=None):
                         prompt = variants[idx]
                         print('[pg_shim] moderation hit: fallback %d/%d (prompt %d chars)'
                               % (idx, len(variants) - 1, len(prompt)), file=sys.stderr)
+                        event('moderation: retry %d/%d without system/stack traces'
+                              % (idx, len(variants) - 1))
                         continue
                     with _lock:
                         _stats['fail'] += 1
@@ -540,6 +557,7 @@ def do_image(model, prompt, size, n):
                 acc['balance'] = float(d.get('remaining_coins', acc['balance']))
                 _stats['ok'] += 1
                 _stats['coin_spend'] += float(d.get('charged_cost') or 0)
+            event('image %s x%d via %s' % (model, len(imgs), acc.get('email')))
             return 200, imgs, d
         except urllib.error.HTTPError as e:
             body = b''
@@ -647,6 +665,10 @@ def _video_worker(tid, model, prompt, duration, ratio, quality):
                 err = (res.get('error') or {}).get('message') or ''
             _video_cache[tid] = {'task_id': tid, 'status': 'failed', 'created': now,
                                  'error': err or 'video generation failed'}
+    if _video_cache[tid].get('status') == 'completed':
+        event('video %s completed' % model)
+    else:
+        event('video %s failed: %s' % (model, _video_cache[tid].get('error', '')[:60]))
 
 
 def _b64_image(url, timeout=60):
@@ -654,6 +676,256 @@ def _b64_image(url, timeout=60):
     req.add_header('User-Agent', UA)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return base64.b64encode(r.read()).decode('ascii')
+
+
+PANEL_HTML = '''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pg_shim // console</title>
+<style>
+:root{
+  --bg:#070b08; --bg2:#0b110c; --panel:#0d140f; --line:#1e2c22; --line2:#2a3d2e;
+  --txt:#c8d6c8; --dim:#63776a; --green:#5dff9a; --amber:#ffc857; --red:#ff6b6b; --cyan:#62d9ff;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:radial-gradient(1200px 600px at 50% -10%, #0f1a12 0%, var(--bg) 60%);
+  color:var(--txt); font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  -webkit-font-smoothing:antialiased;
+}
+body::after{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:9;
+  background:repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 1px, transparent 1px 3px);
+  opacity:.25;
+}
+header{
+  display:flex; align-items:center; justify-content:space-between; gap:16px;
+  padding:14px 22px; border-bottom:1px solid var(--line); background:rgba(9,14,10,.85);
+  position:sticky; top:0; z-index:5; backdrop-filter:blur(6px);
+}
+.brand{font-size:15px; letter-spacing:.08em; color:var(--green); text-shadow:0 0 14px rgba(93,255,154,.25)}
+.brand .dot{display:inline-block; width:8px; height:8px; background:var(--green); border-radius:50%;
+  margin-right:8px; box-shadow:0 0 10px var(--green)}
+.cursor{display:inline-block; width:7px; height:15px; background:var(--green); margin-left:6px;
+  vertical-align:-2px; animation:blink 1.1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.meta{display:flex; align-items:center; gap:18px; font-size:11px; letter-spacing:.12em; color:var(--dim)}
+.meta .on{color:var(--green)}
+.meta .off{color:var(--red)}
+button{
+  font:inherit; font-size:11px; letter-spacing:.1em; color:var(--txt); background:transparent;
+  border:1px solid var(--line2); padding:4px 10px; cursor:pointer; text-transform:uppercase;
+}
+button:hover{color:var(--green); border-color:var(--green)}
+main{padding:22px; max-width:1360px; margin:0 auto; min-height:calc(100vh - 55px);
+  display:flex; flex-direction:column}
+.stats{display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:18px}
+.card{
+  border:1px solid var(--line); background:linear-gradient(180deg,rgba(20,30,23,.55),rgba(10,16,12,.6));
+  padding:12px 14px; position:relative; overflow:hidden;
+}
+.card::before{content:""; position:absolute; inset:0 0 auto 0; height:1px;
+  background:linear-gradient(90deg,var(--green),transparent 60%); opacity:.5}
+.card label{display:block; font-size:10px; letter-spacing:.18em; color:var(--dim)}
+.card b{display:block; font-size:26px; font-weight:500; color:var(--green); margin-top:4px;
+  text-shadow:0 0 16px rgba(93,255,154,.18)}
+.card small{display:block; font-size:10px; color:var(--dim); letter-spacing:.06em}
+.grid{display:grid; grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); gap:14px}
+.panel{border:1px solid var(--line); background:var(--panel); min-width:0}
+.panel h2{
+  margin:0; padding:10px 14px; font-size:11px; font-weight:500; letter-spacing:.18em;
+  color:var(--dim); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center;
+}
+.tag{color:var(--dim); font-size:10px; letter-spacing:.08em; border:1px solid var(--line2); padding:2px 7px}
+table{width:100%; border-collapse:collapse; table-layout:fixed}
+th{font-size:10px; letter-spacing:.14em; color:var(--dim); font-weight:400; text-align:left;
+  padding:8px 14px; border-bottom:1px solid var(--line)}
+td{padding:9px 14px; border-bottom:1px dashed rgba(30,44,34,.55); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:rgba(93,255,154,.035)}
+.num{text-align:right}
+.mail{color:#9fd9b2}
+.pill{font-size:10px; letter-spacing:.08em; padding:2px 7px; border:1px solid}
+.pill.live{color:var(--green); border-color:rgba(93,255,154,.4); background:rgba(93,255,154,.06)}
+.pill.cool{color:var(--amber); border-color:rgba(255,200,87,.4); background:rgba(255,200,87,.06)}
+.pill.dead{color:var(--red); border-color:rgba(255,107,107,.4); background:rgba(255,107,107,.06)}
+.log{padding:10px 14px; max-height:430px; overflow:auto; scrollbar-width:thin}
+.ev{display:flex; gap:12px; padding:3px 0; font-size:12px; color:var(--txt)}
+.ev .t{color:var(--dim); flex:0 0 auto}
+.ev .m{overflow-wrap:anywhere}
+.ev.ok .m{color:var(--green)}
+.ev.warn .m{color:var(--amber)}
+.ev.err .m{color:var(--red)}
+.ev.info .m{color:var(--cyan)}
+.ev.empty{color:var(--dim); font-style:italic}
+.foot{display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap;
+  margin-top:auto; padding-top:16px; border-top:1px dashed var(--line);
+  color:var(--dim); font-size:10px; letter-spacing:.12em}
+.foot .live{color:var(--green)}
+.modal{position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
+  background:rgba(3,6,4,.72); backdrop-filter:blur(3px)}
+.modal.hidden{display:none}
+.modal form{border:1px solid var(--line2); background:var(--panel); padding:18px; width:min(420px,90vw)}
+.modal label{display:block; font-size:10px; letter-spacing:.18em; color:var(--dim); margin-bottom:8px}
+.modal input{width:100%; padding:8px 10px; background:#070b08; border:1px solid var(--line2);
+  color:var(--green); font:inherit; outline:none}
+.modal input:focus{border-color:var(--green)}
+.modal .row{display:flex; gap:8px; margin-top:12px; justify-content:flex-end}
+@media (max-width:980px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}}
+@media (prefers-reduced-motion:reduce){.cursor{animation:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span>pointgpt.shim<span class="cursor"></span></div>
+  <div class="meta"><span id="link" class="off">LINK --</span><span id="clock">--:--:--</span><button id="keybtn">KEY</button></div>
+</header>
+<main>
+  <section class="stats">
+    <div class="card"><label>ALIVE</label><b id="s-alive">--</b><small id="s-accounts">/ -- accounts</small></div>
+    <div class="card"><label>POOL COINS</label><b id="s-coins">--</b><small>available</small></div>
+    <div class="card"><label>FREE LEFT</label><b id="s-free">--</b><small>text requests</small></div>
+    <div class="card"><label>REQUESTS</label><b id="s-req">--</b><small id="s-ok">ok -- · fail --</small></div>
+    <div class="card"><label>SPEND</label><b id="s-spend">--</b><small>coins</small></div>
+  </section>
+  <section class="grid">
+    <div class="panel">
+      <h2>ACCOUNTS <span id="af" class="tag">autofarm --</span></h2>
+      <table>
+        <thead><tr><th style="width:38%">ACCOUNT</th><th>STATE</th><th class="num">BALANCE</th><th class="num">FREE</th><th class="num">LAT</th><th class="num">PROBES</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>EVENTS <span id="uptime" class="tag">up --</span></h2>
+      <div id="events" class="log"></div>
+    </div>
+  </section>
+  <footer class="foot">
+    <span><span class="live">●</span> shim ready</span>
+    <span>GET /health · GET /api/panel · POST /v1/chat/completions</span>
+    <span>refresh 3s</span>
+  </footer>
+</main>
+<div id="keymodal" class="modal hidden">
+  <form id="keyform">
+    <label>PG_KEY</label>
+    <input id="keyinput" type="password" placeholder="bearer key, empty = no auth" autocomplete="off">
+    <div class="row"><button type="button" id="keyclear">CLEAR</button><button type="submit">SAVE</button></div>
+  </form>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+let key = localStorage.getItem('pg_key') || '';
+let timer = null;
+const pad = (n) => String(n).padStart(2, '0');
+function clock(){
+  const d = new Date();
+  $('#clock').textContent = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+function hms(t){
+  const d = new Date(t * 1000);
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+function fmt1(n){ return (Math.round((n || 0) * 10) / 10).toFixed(1); }
+function uptime(s){
+  s = Math.max(0, Math.floor(s || 0));
+  return Math.floor(s/3600) + 'h ' + pad(Math.floor(s%3600/60)) + 'm ' + pad(s%60) + 's';
+}
+function link(ok){
+  const el = $('#link');
+  el.textContent = ok ? 'LINK ONLINE' : 'LINK OFFLINE';
+  el.className = ok ? 'on' : 'off';
+}
+function showKey(){ $('#keymodal').classList.remove('hidden'); $('#keyinput').focus(); }
+function hideKey(){ $('#keymodal').classList.add('hidden'); }
+async function load(){
+  try{
+    const r = await fetch('/api/panel', {headers: key ? {Authorization: 'Bearer ' + key} : {}, cache: 'no-store'});
+    if(r.status === 401){ link(false); showKey(); return; }
+    if(!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    render(d); link(true);
+  }catch(e){ link(false); }
+}
+function render(d){
+  $('#s-alive').textContent = d.pool.alive;
+  $('#s-accounts').textContent = '/ ' + d.pool.accounts + ' accounts';
+  $('#s-coins').textContent = fmt1(d.pool.coins);
+  $('#s-free').textContent = d.pool.free;
+  $('#s-req').textContent = d.stats.requests;
+  $('#s-ok').textContent = 'ok ' + d.stats.ok + ' · fail ' + d.stats.fail;
+  $('#s-spend').textContent = fmt1(d.stats.coin_spend);
+  $('#af').textContent = d.autofarm.enabled ? 'autofarm on · min ' + d.autofarm.min_free : 'autofarm off';
+  $('#uptime').textContent = 'up ' + uptime(d.uptime);
+  const rows = $('#rows');
+  rows.replaceChildren();
+  for(const a of d.accounts){
+    const st = a.dead ? 'dead' : (a.cooldown > 0 ? 'cool' : 'live');
+    const label = a.dead ? 'DEAD' : (a.cooldown > 0 ? 'COOL ' + a.cooldown + 's' : 'LIVE');
+    const tr = document.createElement('tr');
+    const cells = [a.email, '', fmt1(a.balance), a.free, a.latency ? fmt1(a.latency) + 's' : '—', a.probes];
+    for(let i = 0; i < cells.length; i++){
+      const td = document.createElement('td');
+      if(i === 0) td.className = 'mail';
+      if(i >= 2) td.className = 'num';
+      if(i === 1){
+        const pill = document.createElement('span');
+        pill.className = 'pill ' + st; pill.textContent = label;
+        td.appendChild(pill);
+      }else{
+        td.textContent = cells[i];
+      }
+      tr.appendChild(td);
+    }
+    rows.appendChild(tr);
+  }
+  if(!d.accounts.length){
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6; td.className = 'ev empty'; td.textContent = 'bank is empty';
+    tr.appendChild(td); rows.appendChild(tr);
+  }
+  const log = $('#events');
+  log.replaceChildren();
+  for(const e of d.events){
+    const div = document.createElement('div');
+    div.className = 'ev';
+    const m = e.msg || '';
+    if(m.startsWith('text ok') || m.startsWith('image') || m.startsWith('video') && m.includes('completed')) div.classList.add('ok');
+    else if(m.startsWith('moderation') || m.startsWith('autofarm failed')) div.classList.add('warn');
+    else if(m.includes('failed')) div.classList.add('err');
+    else if(m.startsWith('autofarm') || m.startsWith('revived')) div.classList.add('info');
+    const t = document.createElement('span'); t.className = 't'; t.textContent = hms(e.t);
+    const x = document.createElement('span'); x.className = 'm'; x.textContent = m;
+    div.append(t, x); log.appendChild(div);
+  }
+  if(!d.events.length){
+    const div = document.createElement('div'); div.className = 'ev empty';
+    div.textContent = 'no events yet — send a request';
+    log.appendChild(div);
+  }
+}
+$('#keyform').addEventListener('submit', (e) => {
+  e.preventDefault();
+  key = $('#keyinput').value.trim();
+  if(key) localStorage.setItem('pg_key', key); else localStorage.removeItem('pg_key');
+  hideKey(); load();
+});
+$('#keyclear').addEventListener('click', () => {
+  key = ''; localStorage.removeItem('pg_key'); hideKey(); load();
+});
+$('#keybtn').addEventListener('click', () => showKey());
+$('#keymodal').addEventListener('click', (e) => { if(e.target.id === 'keymodal') hideKey(); });
+setInterval(clock, 1000); clock();
+load();
+timer = setInterval(() => { if(!document.hidden) load(); }, 3000);
+</script>
+</body>
+</html>'''
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -704,7 +976,48 @@ class Handler(BaseHTTPRequestHandler):
         w('')
 
     def do_GET(self):
+        if self.path in ('/', '/index.html'):
+            body = PANEL_HTML.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if not self._authorized():
+            return
+        if self.path == '/api/panel':
+            load_pool()
+            now = time.time()
+            with _lock:
+                accounts = []
+                for a in _pool:
+                    accounts.append({
+                        'email': a.get('email'),
+                        'balance': round(a['balance'], 1),
+                        'free': free_left(a),
+                        'dead': bool(a['dead']),
+                        'cooldown': max(0, int(a['cooldown_until'] - now)),
+                        'latency': round(_lat.get(a['token'], 0.0), 1),
+                        'probes': int(a.get('dead_probes') or 0),
+                    })
+                accounts.sort(key=lambda x: (x['dead'], -x['balance']))
+                alive = sum(1 for a in _pool if not a['dead'])
+                coins = round(sum(a['balance'] for a in _pool if not a['dead']), 1)
+                free = sum(free_left(a) for a in _pool if not a['dead'])
+                st = dict(_stats)
+                pool_total = len(_pool)
+            with _events_lock:
+                events = list(_events)
+            self._send(200, {
+                'ok': True, 'now': now, 'uptime': int(now - STARTED),
+                'pool': {'accounts': pool_total, 'alive': alive, 'coins': coins, 'free': free},
+                'stats': st,
+                'autofarm': {'enabled': AUTOFARM, 'min_free': AUTOFARM_MIN_FREE,
+                             'batch': AUTOFARM_BATCH, 'interval': AUTOFARM_INTERVAL},
+                'accounts': accounts, 'events': events,
+            })
             return
         if self.path == '/health':
             load_pool()
@@ -827,6 +1140,7 @@ def main():
     load_pool()
     print('[pg_shim] bank=%s accounts=%d bind=%s:%d autofarm=%s'
           % (BANK_PATH, len(_pool), BIND_HOST, PORT, AUTOFARM), flush=True)
+    print('[pg_shim] panel: http://%s:%d/' % (BIND_HOST, PORT), flush=True)
     threading.Thread(target=_reaper, daemon=True).start()
     threading.Thread(target=_persist_loop, daemon=True).start()
     if AUTOFARM:
