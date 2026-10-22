@@ -332,7 +332,7 @@ def post_form(path, token, fields, timeout=240):
         return r.status, r.read()
 
 
-def messages_to_prompt(messages):
+def messages_to_prompt(messages, include_system=True):
     out = []
     for m in messages or []:
         role = (m.get('role') or 'user').lower()
@@ -343,7 +343,8 @@ def messages_to_prompt(messages):
         if not content:
             continue
         if role == 'system':
-            out.append('[System] ' + content)
+            if include_system:
+                out.append('[System] ' + content)
         elif role == 'assistant':
             out.append('[Assistant] ' + content)
         else:
@@ -351,7 +352,14 @@ def messages_to_prompt(messages):
     return '\n\n'.join(out)
 
 
-def do_text(model, prompt, tries=6):
+def moderation_hit(text):
+    s = text.decode('utf-8', 'ignore') if isinstance(text, (bytes, bytearray)) else str(text)
+    s = s.lower()
+    return ('moderation' in s or 'запрещ' in s
+            or 'prohibited content' in s or 'content policy' in s)
+
+
+def do_text(model, prompt, tries=6, fallback_prompt=None):
     skip = set()
     last_err = None
     mod_hits = 0
@@ -374,8 +382,13 @@ def do_text(model, prompt, tries=6):
             d = json.loads(raw)
             if not d.get('ok'):
                 last_err = str(d)[:200]
-                if 'moderation' in last_err.lower():
+                if moderation_hit(last_err):
                     mod_hits += 1
+                    if mod_hits == 1 and fallback_prompt and fallback_prompt != prompt:
+                        prompt = fallback_prompt
+                        print('[pg_shim] moderation hit: retrying without system prompt',
+                              file=sys.stderr)
+                        continue
                     if mod_hits >= 2:
                         with _lock:
                             _stats['fail'] += 1
@@ -408,14 +421,19 @@ def do_text(model, prompt, tries=6):
                 mark_cooldown(acc, 120)
             elif e.code in (402, 400):
                 low = body.lower()
-                if b'moderation' in low:
+                if moderation_hit(body):
                     mod_hits += 1
+                    if mod_hits == 1 and fallback_prompt and fallback_prompt != prompt:
+                        prompt = fallback_prompt
+                        print('[pg_shim] moderation hit: retrying without system prompt',
+                              file=sys.stderr)
+                        continue
                     if mod_hits >= 2:
                         with _lock:
                             _stats['fail'] += 1
                         return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
                                                'type': 'moderation_error'}}
-                    continue  # one false positive is possible: try another token
+                    continue
                 if b'coin' in low or b'\xd0\xb1\xd0\xb0\xd0\xbb' in low:
                     mark_dead(acc)
         except Exception as e:
@@ -673,11 +691,13 @@ class Handler(BaseHTTPRequestHandler):
             _stats['requests'] += 1
         if self.path == '/v1/chat/completions':
             model = req.get('model') or 'gpt-6-astra'
-            prompt = messages_to_prompt(req.get('messages'))
+            messages = req.get('messages')
+            prompt = messages_to_prompt(messages)
             if not prompt:
                 self._send(400, {'error': {'message': 'empty messages'}})
                 return
-            st, d = do_text(model, prompt)
+            fallback = messages_to_prompt(messages, include_system=False)
+            st, d = do_text(model, prompt, fallback_prompt=fallback or None)
             if st != 200:
                 self._send(st, d)
                 return
