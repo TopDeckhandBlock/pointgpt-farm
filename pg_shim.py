@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -332,7 +333,7 @@ def post_form(path, token, fields, timeout=240):
         return r.status, r.read()
 
 
-def messages_to_prompt(messages, include_system=True):
+def messages_to_prompt(messages, include_system=True, max_chars=None):
     out = []
     for m in messages or []:
         role = (m.get('role') or 'user').lower()
@@ -349,7 +350,18 @@ def messages_to_prompt(messages, include_system=True):
             out.append('[Assistant] ' + content)
         else:
             out.append('[User] ' + content)
-    return '\n\n'.join(out)
+    dropped = False
+    if max_chars:
+        total = sum(len(x) + 2 for x in out)
+        while len(out) > 1 and total > max_chars:
+            total -= len(out[0]) + 2
+            out.pop(0)
+            dropped = True
+        if out and total > max_chars:
+            out[-1] = out[-1][-max_chars:]
+            dropped = True
+    text = '\n\n'.join(out)
+    return ('[Earlier conversation omitted]\n\n' + text) if dropped else text
 
 
 def moderation_hit(text):
@@ -359,10 +371,32 @@ def moderation_hit(text):
             or 'prohibited content' in s or 'content policy' in s)
 
 
-def do_text(model, prompt, tries=6, fallback_prompt=None):
+V8_FRAME = re.compile(r'^[ \t]+at .*?:\d+:\d+\)?[ \t]*$', re.M)
+
+
+def sanitize_prompt(text):
+    text = V8_FRAME.sub('', text)
+    return re.sub(r'\n{3,}', '\n\n', text)
+
+
+def dump_moderated_prompt(prompt):
+    if os.environ.get('PG_DUMP_MODERATION') != '1':
+        return
+    try:
+        with open('/tmp/opencode/pg_moderation_prompt.txt', 'w') as f:
+            f.write(prompt[:2000000])
+    except Exception:
+        pass
+
+
+def do_text(model, prompt, tries=6, fallbacks=None):
+    variants = [prompt]
+    for p in fallbacks or []:
+        if p and p not in variants:
+            variants.append(p)
+    idx = 0
     skip = set()
     last_err = None
-    mod_hits = 0
     for i in range(tries):
         acc = pick('text', skip, need=1.0)
         if acc is None:
@@ -383,17 +417,18 @@ def do_text(model, prompt, tries=6, fallback_prompt=None):
             if not d.get('ok'):
                 last_err = str(d)[:200]
                 if moderation_hit(last_err):
-                    mod_hits += 1
-                    if mod_hits == 1 and fallback_prompt and fallback_prompt != prompt:
-                        prompt = fallback_prompt
-                        print('[pg_shim] moderation hit: retrying without system prompt',
-                              file=sys.stderr)
+                    if idx == 0:
+                        dump_moderated_prompt(prompt)
+                    if idx + 1 < len(variants):
+                        idx += 1
+                        prompt = variants[idx]
+                        print('[pg_shim] moderation hit: fallback %d/%d (prompt %d chars)'
+                              % (idx, len(variants) - 1, len(prompt)), file=sys.stderr)
                         continue
-                    if mod_hits >= 2:
-                        with _lock:
-                            _stats['fail'] += 1
-                        return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
-                                               'type': 'moderation_error'}}
+                    with _lock:
+                        _stats['fail'] += 1
+                    return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
+                                           'type': 'moderation_error'}}
                 continue
             with _lock:
                 acc['balance'] = float(d.get('remaining_coins', acc['balance']))
@@ -422,18 +457,18 @@ def do_text(model, prompt, tries=6, fallback_prompt=None):
             elif e.code in (402, 400):
                 low = body.lower()
                 if moderation_hit(body):
-                    mod_hits += 1
-                    if mod_hits == 1 and fallback_prompt and fallback_prompt != prompt:
-                        prompt = fallback_prompt
-                        print('[pg_shim] moderation hit: retrying without system prompt',
-                              file=sys.stderr)
+                    if idx == 0:
+                        dump_moderated_prompt(prompt)
+                    if idx + 1 < len(variants):
+                        idx += 1
+                        prompt = variants[idx]
+                        print('[pg_shim] moderation hit: fallback %d/%d (prompt %d chars)'
+                              % (idx, len(variants) - 1, len(prompt)), file=sys.stderr)
                         continue
-                    if mod_hits >= 2:
-                        with _lock:
-                            _stats['fail'] += 1
-                        return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
-                                               'type': 'moderation_error'}}
-                    continue
+                    with _lock:
+                        _stats['fail'] += 1
+                    return 400, {'error': {'message': 'pg_shim: upstream moderation rejected the prompt (text_moderation_failed)',
+                                           'type': 'moderation_error'}}
                 if b'coin' in low or b'\xd0\xb1\xd0\xb0\xd0\xbb' in low:
                     mark_dead(acc)
         except Exception as e:
@@ -697,7 +732,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {'error': {'message': 'empty messages'}})
                 return
             fallback = messages_to_prompt(messages, include_system=False)
-            st, d = do_text(model, prompt, fallback_prompt=fallback or None)
+            sanitized = sanitize_prompt(fallback)
+            tail = messages_to_prompt(messages, include_system=False, max_chars=60000)
+            st, d = do_text(model, prompt, fallbacks=[fallback, sanitized, tail])
             if st != 200:
                 self._send(st, d)
                 return
