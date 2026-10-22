@@ -399,6 +399,17 @@ def sanitize_prompt(text):
     return re.sub(r'\n{3,}', '\n\n', text)
 
 
+def trim_prompt(text, max_chars=34000, head_chars=9000):
+    """Last-resort context shrink: keep the head (compaction summary) and the
+    most recent messages, drop the middle that upstream moderation keeps
+    flagging."""
+    if len(text) <= max_chars:
+        return text
+    tail = max_chars - head_chars
+    return (text[:head_chars] + '\n\n[... earlier conversation omitted ...]\n\n'
+            + text[-tail:])
+
+
 def dump_moderated_prompt(prompt):
     if os.environ.get('PG_DUMP_MODERATION') != '1':
         return
@@ -1064,8 +1075,8 @@ class Handler(BaseHTTPRequestHandler):
             fallback = messages_to_prompt(messages, include_system=False)
             sanitized = sanitize_prompt(prompt)
             sanitized_nosys = sanitize_prompt(fallback)
-            tail = messages_to_prompt(messages, include_system=False, max_chars=60000)
-            st, d = do_text(model, prompt, fallbacks=[sanitized, fallback, sanitized_nosys, tail])
+            trimmed = trim_prompt(sanitized_nosys)
+            st, d = do_text(model, prompt, fallbacks=[sanitized, fallback, sanitized_nosys, trimmed])
             if st != 200:
                 self._send(st, d)
                 return
