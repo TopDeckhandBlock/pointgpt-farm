@@ -6,12 +6,19 @@ Endpoints:
   GET  /v1/models
   POST /v1/chat/completions   (stream + non-stream; tools ignored, plain text upstream)
   POST /v1/images/generations (Nano Banana 2 / GPT Image 2.5 / Seedream 5 ...)
+  POST /v1/video/generations  (async by default: returns task_id; sync=true blocks)
+  GET  /v1/video/tasks/{id}
   GET  /health
 Env: PG_BANK (path, default ./master_bank.jsonl), PG_PORT (default 8797),
+     PG_BIND (default 127.0.0.1), PG_KEY (optional bearer key),
+     PG_PERSIST_INTERVAL (sec, default 60), PG_REAP_INTERVAL (sec, default 300),
      PG_AUTOFARM (1/0, default 1), PG_AUTOFARM_MIN_FREE (default 5),
      PG_AUTOFARM_BATCH (default 1), PG_AUTOFARM_INTERVAL (sec, default 120).
 Stdlib only. Python 3.9+.
 """
+import atexit
+import base64
+import hmac
 import json
 import os
 import random
@@ -30,6 +37,10 @@ UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 
 
 BANK_PATH = os.environ.get('PG_BANK', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'master_bank.jsonl'))
 PORT = int(os.environ.get('PG_PORT', '8797'))
+BIND_HOST = os.environ.get('PG_BIND', '127.0.0.1')
+API_KEY = os.environ.get('PG_KEY', '')
+PERSIST_INTERVAL = int(os.environ.get('PG_PERSIST_INTERVAL', '60'))
+REAP_INTERVAL = int(os.environ.get('PG_REAP_INTERVAL', '300'))
 AUTOFARM = os.environ.get('PG_AUTOFARM', '1') != '0'
 AUTOFARM_MIN_FREE = int(os.environ.get('PG_AUTOFARM_MIN_FREE', '5'))
 AUTOFARM_BATCH = int(os.environ.get('PG_AUTOFARM_BATCH', '1'))
@@ -46,14 +57,27 @@ IMAGE_MODELS = [
 ]
 
 VIDEO_MODELS = ['minimax-h3', 'grok', 'seedance-2-mini', 'wan-3-0', 'veo']
+VIDEO_COSTS = {'seedance-2-mini': 8.0, 'minimax-h3': 10.0, 'veo': 64.0,
+               'kling': 50.0, 'grok': 10.0, 'wan-3-0': 10.0}
 _video_cache = {}   # task_id -> result dict
 
 _lock = threading.Lock()
-_pool = []          # list of dicts: token, balance, dead, cooldown_until
+_bank_lock = threading.Lock()
+_pool = []          # list of dicts: token, balance, dead, cooldown_until, dead_probes, next_probe
 _pool_mtime = 0.0
-_used = {}          # (utcdate, token) -> free requests used today
+_used = {}          # (quota-day, token) -> free requests used today
 _stats = {'requests': 0, 'ok': 0, 'fail': 0, 'free_hits': 0, 'coin_spend': 0.0}
 FREE_DAILY = 5      # upstream: 5 free text requests / account / day (reset 21:00 UTC)
+
+
+def video_cost(model, duration):
+    """Coins needed for a video job; duration scales linearly from the 5s base."""
+    base = VIDEO_COSTS.get(model, 10.0)
+    try:
+        d = float(duration or 5)
+    except Exception:
+        d = 5.0
+    return round(base * max(1.0, d / 5.0), 1)
 
 
 def _today():
@@ -89,7 +113,9 @@ def load_pool():
                 if t and t not in toks:
                     toks.add(t)
                     rows.append({'token': t, 'balance': float(d.get('balance') or 0),
-                                 'dead': False, 'cooldown_until': 0.0})
+                                 'email': d.get('email') or t[:8],
+                                 'dead': False, 'cooldown_until': 0.0,
+                                 'dead_probes': 0, 'next_probe': 0.0})
     except OSError:
         return
     if rows:
@@ -98,16 +124,18 @@ def load_pool():
             for r in rows:
                 o = old.get(r['token'])
                 if o is not None:
-                    # keep quarantine state across bank reloads
-                    r['dead'] = o['dead']
-                    r['cooldown_until'] = o['cooldown_until']
+                    # in-memory balance is fresher; keep quarantine state too
+                    r['balance'] = o['balance']
+                    for k in ('dead', 'cooldown_until', 'dead_probes', 'next_probe'):
+                        r[k] = o[k]
             _pool = rows
         _pool_mtime = mt
 
 
-def pick(kind='text', skip=()):
-    """Auto-switcher: round-robin over alive accounts.
-    Text requests prefer accounts with free daily quota left, then richest."""
+def pick(kind='text', skip=(), need=0.0):
+    """Auto-switcher: alive, off-cooldown accounts not tried yet.
+    Text prefers accounts with free daily quota (free costs nothing regardless
+    of balance); charged work only goes to accounts that can cover `need`."""
     load_pool()
     now = time.time()
     with _lock:
@@ -119,6 +147,11 @@ def pick(kind='text', skip=()):
             free = [a for a in cand if free_left(a) > 0]
             if free:
                 cand = free
+                need = 0.0
+        if need > 0:
+            cand = [a for a in cand if a['balance'] >= need]
+            if not cand:
+                return None
         cand.sort(key=lambda a: -a['balance'])
         return random.choice(cand[:4])
 
@@ -126,6 +159,8 @@ def pick(kind='text', skip=()):
 def mark_dead(acc):
     with _lock:
         acc['dead'] = True
+        acc['dead_probes'] = 0
+        acc['next_probe'] = time.time()
 
 
 def mark_cooldown(acc, secs):
@@ -134,39 +169,109 @@ def mark_cooldown(acc, secs):
 
 
 def _recheck(acc):
-    """Liveness probe for a dead account via /me/wheel: 402-dead accounts
-    (out of coins) can revive after the daily wheel spin refills the balance,
-    so dead is not permanent."""
+    """Liveness/balance probe via /me/wheel (cheap GET). Returns True if the
+    token is still valid; out-of-coins accounts revive once the daily wheel
+    spin refills their balance."""
     req = urllib.request.Request(BASE + '/api/miniapp/me/wheel')
     req.add_header('Authorization', AU + acc['token'])
     req.add_header('User-Agent', UA)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             d = json.loads(r.read())
-        with _lock:
-            acc['balance'] = float(d.get('balance') or acc['balance'])
-            acc['dead'] = False
-            acc['cooldown_until'] = 0.0
-    except urllib.error.HTTPError as e:
-        pass  # 401/403: token really dead, stays dead; 429/5xx: retry next round
+    except Exception:
+        return False
+    with _lock:
+        acc['balance'] = float(d.get('balance') or acc['balance'])
+    return True
+
+
+def _reaper():
+    """Housekeeping: revive dead accounts with exponential backoff (401/402/
+    429 all retried, backing off to 1h), prune stale quota counters and old
+    video tasks."""
+    while True:
+        time.sleep(REAP_INTERVAL)
+        try:
+            load_pool()
+            now = time.time()
+            today = _today()
+            with _lock:
+                todo = [a for a in _pool if a['dead'] and a['next_probe'] <= now]
+                for k in [k for k in _used if k[0] != today]:
+                    _used.pop(k, None)
+                for tid in [t for t, v in _video_cache.items()
+                            if now - v.get('created', now) > 86400]:
+                    _video_cache.pop(tid, None)
+            for acc in todo:
+                ok = _recheck(acc)
+                with _lock:
+                    if ok:
+                        acc['dead'] = False
+                        acc['dead_probes'] = 0
+                        acc['next_probe'] = 0.0
+                        acc['cooldown_until'] = 0.0
+                    else:
+                        acc['dead_probes'] += 1
+                        delay = min(300 * (2 ** acc['dead_probes']), 3600)
+                        acc['next_probe'] = time.time() + delay
+                if ok:
+                    print('[pg_shim] revived %s balance=%.1f'
+                          % (acc['email'], acc['balance']), flush=True)
+                else:
+                    print('[pg_shim] probe failed %s, next in %ds'
+                          % (acc['email'], int(acc['next_probe'] - time.time())), flush=True)
+                time.sleep(1.5)
+        except Exception:
+            pass
+
+
+def persist_balances():
+    """Write live balances back into the bank (atomic replace). Only the
+    balance field is touched; all other fields and unknown lines are kept."""
+    global _pool_mtime
+    if not os.path.exists(BANK_PATH):
+        return
+    with _lock:
+        live = {a['token']: round(a['balance'], 2) for a in _pool}
+    if not live:
+        return
+    try:
+        with _bank_lock:
+            with open(BANK_PATH, encoding='utf-8') as f:
+                lines = f.readlines()
+            out = []
+            changed = False
+            for line in lines:
+                s = line.strip()
+                d = None
+                if s:
+                    try:
+                        d = json.loads(s)
+                    except Exception:
+                        d = None
+                if isinstance(d, dict) and d.get('token') in live:
+                    t = d['token']
+                    if float(d.get('balance') or 0) != live[t]:
+                        d['balance'] = live[t]
+                        line = json.dumps(d, ensure_ascii=False) + '\n'
+                        changed = True
+                out.append(line if line.endswith('\n') else line + '\n')
+            if not changed:
+                return
+            tmp = BANK_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.writelines(out)
+            os.replace(tmp, BANK_PATH)
+            with _lock:
+                _pool_mtime = os.path.getmtime(BANK_PATH)
     except Exception:
         pass
 
 
-def _reaper():
-    """Auto-switcher daemon: periodically probes dead accounts and revives
-    the ones that came back (daily wheel refills coins at 00:00 MSK)."""
+def _persist_loop():
     while True:
-        time.sleep(300)
-        try:
-            load_pool()
-            with _lock:
-                dead = [a for a in _pool if a['dead']]
-            for acc in dead:
-                _recheck(acc)
-                time.sleep(1.5)
-        except Exception:
-            pass
+        time.sleep(PERSIST_INTERVAL)
+        persist_balances()
 
 
 def _autofarm():
@@ -193,7 +298,8 @@ def _autofarm():
             print('[pg_shim] autofarm: free_left=%d < %d, farming %d'
                   % (left, AUTOFARM_MIN_FREE, AUTOFARM_BATCH), flush=True)
             for _ in range(AUTOFARM_BATCH):
-                r = pg_farm.farm_one()
+                with _bank_lock:
+                    r = pg_farm.farm_one()
                 if r.get('status') == 'ok':
                     print('[pg_shim] autofarm: +%s bal=%s'
                           % (r.get('email'), r.get('balance')), flush=True)
@@ -249,7 +355,7 @@ def do_text(model, prompt, tries=6):
     skip = set()
     last_err = None
     for i in range(tries):
-        acc = pick('text', skip)
+        acc = pick('text', skip, need=1.0)
         if acc is None:
             return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err,
                                    'type': 'upstream_unavailable'}}
@@ -277,6 +383,9 @@ def do_text(model, prompt, tries=6):
                     _used[k] = _used.get(k, 0) + 1
                 else:
                     _stats['coin_spend'] += float(d['charged_cost'])
+                    # quota was spent upstream before our restart: don't
+                    # keep preferring this account as "free" today
+                    _used[(_today(), acc['token'])] = FREE_DAILY
             return 200, d
         except urllib.error.HTTPError as e:
             body = b''
@@ -321,13 +430,14 @@ def do_image(model, prompt, size, n):
             except Exception:
                 pass
     for i in range(5):
-        acc = pick('image', skip)
+        acc = pick('image', skip, need=1.0)
         if acc is None:
             return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err}}
         skip.add(acc['token'])
         fields = {
             'prompt': prompt, 'model': model, 'aspect_ratio': ratio,
-            'image_size': '2K', 'image_quality': 'high', 'generation_mode': 'text_to_image',
+            'count': str(n), 'image_size': '2K', 'image_quality': 'high',
+            'generation_mode': 'text_to_image',
             'persona': 'universal', 'provider_preference': '',
             'serial_session_id': '', 'serial_operation_id': '', 'serial_series_index': '0',
             'client_request_id': uuid.uuid4().hex, 'studio_chat_id': '',
@@ -366,14 +476,21 @@ def do_image(model, prompt, size, n):
 
 
 def do_video(model, prompt, duration, ratio, quality):
-    """Sync video generation: upstream returns video_url directly (2-4 min)."""
+    """Video generation: upstream returns video_url directly (2-4 min).
+    Only accounts able to cover the job's coin cost are tried."""
     skip = set()
     last_err = None
-    audio = 'false' if model.startswith('seedance') else 'true'
+    cost = video_cost(model, duration)
+    audio = 'true'  # upstream rejects seedance-2-mini with generate_audio=false
     for i in range(4):
-        acc = pick('video', skip)
+        acc = pick('video', skip, need=cost)
         if acc is None:
-            return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err}}
+            with _lock:
+                best = max([a['balance'] for a in _pool if not a['dead']] or [0])
+            return 503, {'error': {'message': 'pg_shim: no account can afford %s '
+                                               '(%.1f coins, top balance %.1f)'
+                                               % (model, cost, best),
+                                   'type': 'upstream_unavailable'}}
         skip.add(acc['token'])
         fields = {
             'prompt': prompt, 'model': model, 'mode': 'video', 'ratio': ratio or '16:9',
@@ -401,7 +518,6 @@ def do_video(model, prompt, duration, ratio, quality):
             tid = d.get('task_id') or ('pg' + uuid.uuid4().hex[:16])
             res = {'task_id': tid, 'status': 'completed', 'video_url': url,
                    'charged_cost': d.get('charged_cost'), 'remaining_coins': d.get('remaining_coins')}
-            _video_cache[tid] = res
             return 200, res
         except urllib.error.HTTPError as e:
             body = b''
@@ -424,6 +540,37 @@ def do_video(model, prompt, duration, ratio, quality):
     return 502, {'error': {'message': 'pg_shim video failed: %s' % last_err}}
 
 
+def _video_worker(tid, model, prompt, duration, ratio, quality):
+    try:
+        st, res = do_video(model, prompt, duration, ratio, quality)
+    except Exception as e:
+        st, res = 502, {'error': {'message': repr(e)[:200]}}
+    now = int(time.time())
+    with _lock:
+        if st == 200 and isinstance(res, dict) and res.get('video_url'):
+            res = dict(res)
+            res['created'] = now
+            res['status'] = 'completed'
+            upstream_id = res.get('task_id')
+            res['task_id'] = tid
+            _video_cache[tid] = res
+            if upstream_id and upstream_id != tid:
+                _video_cache[upstream_id] = res
+        else:
+            err = ''
+            if isinstance(res, dict):
+                err = (res.get('error') or {}).get('message') or ''
+            _video_cache[tid] = {'task_id': tid, 'status': 'failed', 'created': now,
+                                 'error': err or 'video generation failed'}
+
+
+def _b64_image(url, timeout=60):
+    req = urllib.request.Request(url)
+    req.add_header('User-Agent', UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return base64.b64encode(r.read()).decode('ascii')
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -437,6 +584,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _authorized(self):
+        if not API_KEY:
+            return True
+        got = self.headers.get('Authorization') or ''
+        if hmac.compare_digest(got, 'Bearer ' + API_KEY):
+            return True
+        self.close_connection = True
+        self._send(401, {'error': {'message': 'invalid api key', 'type': 'authentication_error'}})
+        return False
 
     def _sse(self, chunks_list, model):
         self.send_response(200)
@@ -462,6 +619,8 @@ class Handler(BaseHTTPRequestHandler):
         w('')
 
     def do_GET(self):
+        if not self._authorized():
+            return
         if self.path == '/health':
             load_pool()
             with _lock:
@@ -476,9 +635,13 @@ class Handler(BaseHTTPRequestHandler):
                       for m in IMAGE_MODELS + VIDEO_MODELS + TEXT_MODELS]
             self._send(200, {'object': 'list', 'data': models})
         elif self.path.startswith('/v1/video/tasks/'):
-            tid = self.path.rsplit('/', 1)[-1]
-            res = _video_cache.get(tid)
-            self._send(200, res or {'task_id': tid, 'status': 'unknown'})
+            tid = self.path.rsplit('/', 1)[-1].split('?')[0]
+            with _lock:
+                res = _video_cache.get(tid)
+            if res is None:
+                self._send(404, {'error': {'message': 'unknown task id'}})
+            else:
+                self._send(200, res)
         else:
             self._send(404, {'error': {'message': 'not found'}})
 
@@ -488,6 +651,8 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n) or b'{}')
         except Exception:
             self._send(400, {'error': {'message': 'bad json'}})
+            return
+        if not self._authorized():
             return
         with _lock:
             _stats['requests'] += 1
@@ -520,31 +685,64 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif self.path.startswith('/v1/video/generations'):
             model = req.get('model') or 'minimax-h3'
-            st, d = do_video(model, req.get('prompt') or '', req.get('duration') or 5,
-                             req.get('ratio') or req.get('size') or '16:9', req.get('quality'))
-            self._send(st, d)
+            prompt = req.get('prompt') or ''
+            duration = req.get('duration') or 5
+            ratio = req.get('ratio') or req.get('size') or '16:9'
+            quality = req.get('quality')
+            if req.get('sync'):
+                st, d = do_video(model, prompt, duration, ratio, quality)
+                if st == 200 and isinstance(d, dict) and d.get('task_id'):
+                    with _lock:
+                        _video_cache.setdefault(d['task_id'], dict(d, created=int(time.time())))
+                self._send(st, d)
+                return
+            tid = 'pg' + uuid.uuid4().hex[:16]
+            with _lock:
+                _video_cache[tid] = {'task_id': tid, 'status': 'processing',
+                                     'model': model, 'created': int(time.time())}
+            threading.Thread(target=_video_worker,
+                             args=(tid, model, prompt, duration, ratio, quality),
+                             daemon=True).start()
+            self._send(200, {'task_id': tid, 'status': 'processing', 'model': model,
+                             'poll': '/v1/video/tasks/' + tid})
         elif self.path == '/v1/images/generations':
             model = req.get('model') or 'nanobanano-2'
             if model in ('dall-e-3', 'dall-e-2', 'gpt-image-1'):
                 model = 'nanobanano-2'
             prompt = req.get('prompt') or ''
-            st, d, meta = do_image(model, prompt, req.get('size'), req.get('n') or 1)
+            try:
+                n = max(1, min(10, int(req.get('n') or 1)))
+            except Exception:
+                n = 1
+            st, d, meta = do_image(model, prompt, req.get('size'), n)
             if st != 200:
                 self._send(st, d)
                 return
-            self._send(200, {'created': int(time.time()),
-                             'data': [{'url': u} for u in d[:int(req.get('n') or 1) or 1]]})
+            fmt = req.get('response_format') or 'url'
+            data = []
+            for u in d[:n]:
+                item = {'url': u}
+                if fmt == 'b64_json':
+                    try:
+                        item = {'b64_json': _b64_image(u)}
+                    except Exception:
+                        pass
+                data.append(item)
+            self._send(200, {'created': int(time.time()), 'data': data})
         else:
             self._send(404, {'error': {'message': 'not found'}})
 
 
 def main():
     load_pool()
-    print('[pg_shim] bank=%s accounts=%d port=%d' % (BANK_PATH, len(_pool), PORT))
+    print('[pg_shim] bank=%s accounts=%d bind=%s:%d autofarm=%s'
+          % (BANK_PATH, len(_pool), BIND_HOST, PORT, AUTOFARM), flush=True)
     threading.Thread(target=_reaper, daemon=True).start()
+    threading.Thread(target=_persist_loop, daemon=True).start()
     if AUTOFARM:
         threading.Thread(target=_autofarm, daemon=True).start()
-    srv = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
+    atexit.register(persist_balances)
+    srv = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     srv.daemon_threads = True
     srv.serve_forever()
 
