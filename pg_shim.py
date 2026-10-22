@@ -47,6 +47,15 @@ _pool = []          # list of dicts: token, balance, dead, cooldown_until
 _pool_mtime = 0.0
 _used = {}          # (utcdate, token) -> free requests used today
 _stats = {'requests': 0, 'ok': 0, 'fail': 0, 'free_hits': 0, 'coin_spend': 0.0}
+FREE_DAILY = 5      # upstream: 5 free text requests / account / day (reset 21:00 UTC)
+
+
+def _today():
+    return time.strftime('%Y-%m-%d', time.gmtime())
+
+
+def free_left(acc):
+    return max(0, FREE_DAILY - _used.get((_today(), acc['token']), 0))
 
 
 def load_pool():
@@ -82,8 +91,9 @@ def load_pool():
         _pool_mtime = mt
 
 
-def pick(skip=()):
-    """Round-robin over alive tokens, cheapest-cooldown first."""
+def pick(kind='text', skip=()):
+    """Auto-switcher: round-robin over alive accounts.
+    Text requests prefer accounts with free daily quota left, then richest."""
     load_pool()
     now = time.time()
     with _lock:
@@ -91,11 +101,12 @@ def pick(skip=()):
                 and a['token'] not in skip]
         if not cand:
             return None
-        random.shuffle(cand)
-        # prefer accounts with more coins so free-tier accounts survive
+        if kind == 'text':
+            free = [a for a in cand if free_left(a) > 0]
+            if free:
+                cand = free
         cand.sort(key=lambda a: -a['balance'])
-        top = cand[:8]
-        return random.choice(top)
+        return random.choice(cand[:4])
 
 
 def mark_dead(acc):
@@ -106,6 +117,42 @@ def mark_dead(acc):
 def mark_cooldown(acc, secs):
     with _lock:
         acc['cooldown_until'] = time.time() + secs
+
+
+def _recheck(acc):
+    """Liveness probe for a dead account via /me/wheel: 402-dead accounts
+    (out of coins) can revive after the daily wheel spin refills the balance,
+    so dead is not permanent."""
+    req = urllib.request.Request(BASE + '/api/miniapp/me/wheel')
+    req.add_header('Authorization', AU + acc['token'])
+    req.add_header('User-Agent', UA)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read())
+        with _lock:
+            acc['balance'] = float(d.get('balance') or acc['balance'])
+            acc['dead'] = False
+            acc['cooldown_until'] = 0.0
+    except urllib.error.HTTPError as e:
+        pass  # 401/403: token really dead, stays dead; 429/5xx: retry next round
+    except Exception:
+        pass
+
+
+def _reaper():
+    """Auto-switcher daemon: periodically probes dead accounts and revives
+    the ones that came back (daily wheel refills coins at 00:00 MSK)."""
+    while True:
+        time.sleep(300)
+        try:
+            load_pool()
+            with _lock:
+                dead = [a for a in _pool if a['dead']]
+            for acc in dead:
+                _recheck(acc)
+                time.sleep(1.5)
+        except Exception:
+            pass
 
 
 def post_form(path, token, fields, timeout=240):
@@ -149,7 +196,7 @@ def do_text(model, prompt, tries=6):
     skip = set()
     last_err = None
     for i in range(tries):
-        acc = pick(skip)
+        acc = pick('text', skip)
         if acc is None:
             return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err,
                                    'type': 'upstream_unavailable'}}
@@ -173,6 +220,8 @@ def do_text(model, prompt, tries=6):
                 _stats['ok'] += 1
                 if float(d.get('charged_cost') or 0) == 0:
                     _stats['free_hits'] += 1
+                    k = (_today(), acc['token'])
+                    _used[k] = _used.get(k, 0) + 1
                 else:
                     _stats['coin_spend'] += float(d['charged_cost'])
             return 200, d
@@ -219,7 +268,7 @@ def do_image(model, prompt, size, n):
             except Exception:
                 pass
     for i in range(5):
-        acc = pick(skip)
+        acc = pick('image', skip)
         if acc is None:
             return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err}}
         skip.add(acc['token'])
@@ -269,7 +318,7 @@ def do_video(model, prompt, duration, ratio, quality):
     last_err = None
     audio = 'false' if model.startswith('seedance') else 'true'
     for i in range(4):
-        acc = pick(skip)
+        acc = pick('video', skip)
         if acc is None:
             return 503, {'error': {'message': 'pg_shim: pool exhausted (%s)' % last_err}}
         skip.add(acc['token'])
@@ -365,13 +414,18 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 alive = sum(1 for a in _pool if not a['dead'])
                 coins = round(sum(a['balance'] for a in _pool if not a['dead']), 1)
+                free = sum(free_left(a) for a in _pool if not a['dead'])
                 st = dict(_stats)
             self._send(200, {'ok': True, 'alive_accounts': alive, 'total_accounts': len(_pool),
-                             'pool_coins': coins, 'stats': st})
+                             'pool_coins': coins, 'free_text_left': free, 'stats': st})
         elif self.path.startswith('/v1/models'):
             models = [{'id': m, 'object': 'model', 'created': 1761000000, 'owned_by': 'pointgpt'}
                       for m in IMAGE_MODELS + VIDEO_MODELS + TEXT_MODELS]
             self._send(200, {'object': 'list', 'data': models})
+        elif self.path.startswith('/v1/video/tasks/'):
+            tid = self.path.rsplit('/', 1)[-1]
+            res = _video_cache.get(tid)
+            self._send(200, res or {'task_id': tid, 'status': 'unknown'})
         else:
             self._send(404, {'error': {'message': 'not found'}})
 
@@ -416,10 +470,6 @@ class Handler(BaseHTTPRequestHandler):
             st, d = do_video(model, req.get('prompt') or '', req.get('duration') or 5,
                              req.get('ratio') or req.get('size') or '16:9', req.get('quality'))
             self._send(st, d)
-        elif self.path.startswith('/v1/video/tasks/'):
-            tid = self.path.rsplit('/', 1)[-1]
-            res = _video_cache.get(tid)
-            self._send(200, res or {'task_id': tid, 'status': 'unknown'})
         elif self.path == '/v1/images/generations':
             model = req.get('model') or 'nanobanano-2'
             if model in ('dall-e-3', 'dall-e-2', 'gpt-image-1'):
@@ -438,6 +488,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     load_pool()
     print('[pg_shim] bank=%s accounts=%d port=%d' % (BANK_PATH, len(_pool), PORT))
+    threading.Thread(target=_reaper, daemon=True).start()
     srv = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     srv.daemon_threads = True
     srv.serve_forever()
