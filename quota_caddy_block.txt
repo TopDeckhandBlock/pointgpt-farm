@@ -1,0 +1,28 @@
+# [PGQUOTA 24.10] per-key daily media quota gate (protects the wheel coin pool)
+	handle /v1/images/generations {
+		reverse_proxy 127.0.0.1:8806 {
+			flush_interval -1
+			transport http {
+				read_timeout 900s
+				dial_timeout 10s
+			}
+		}
+	}
+	handle /v1/video/generations {
+		reverse_proxy 127.0.0.1:8806 {
+			flush_interval -1
+			transport http {
+				read_timeout 900s
+				dial_timeout 10s
+			}
+		}
+	}
+	handle /v1/videos/* {
+		reverse_proxy 127.0.0.1:8806 {
+			flush_interval -1
+			transport http {
+				read_timeout 900s
+				dial_timeout 10s
+			}
+		}
+	}

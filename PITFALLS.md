@@ -1,32 +1,22 @@
-# Pitfalls (production-proven)
+## 5. Per-key daily quota gate sits in front of new-api (:8806)
+The coin pool is finite: 172 alive accounts yield roughly one wheel spin each per day
+(~+3300 coins/day), while a single unrestricted client burned 1603 coins in two hours.
+`PG_RATE_PER_MIN` (20/min) only smooths bursts; it does not cap a day.
 
-## 1. toolgate disables media models every 5 minutes
-`/root/toolgate.py` sets `abilities.enabled=0` for every model outside its `ALLOW` set.
-PointGPT media models were missing -> all 9 dropped every 5 min -> clients saw short 503
-windows even with a healthy pool. Add them to ALLOW:
+`pg_quota_gate.py` listens on `127.0.0.1:8806`, sits between Caddy and new-api
+(`PGQ_UPSTREAM=http://127.0.0.1:48001`), counts `POST /v1/images/generations` and
+`POST /v1/video/generations` per `Authorization` key per UTC day, and returns
+`429 {"code":"pg_daily_quota"}` after `PG_DAILY_PER_KEY` (default 5). GET (video polling)
+is never counted. State: `/opt/pg-quota/quota.json`, reset at 00:00 UTC.
+Inspect a key: `curl -H "Authorization: Bearer <key>" http://127.0.0.1:8806/__quota`.
+Caddy wiring is `quota_caddy_block.txt`, inserted before `handle {}` in the
+`api.reformboss.com` block; `/v1/audio/generations` stays on `:8805` (already charges 20).
 
-```
-nano-banana, gpt-image-2.5, seedream-5, z-image, poyo-sumo-v5,
-minimax-h3, seedance-2-mini, nanobanano-2, nanobanano-2-2k
-```
-
-Detect who disables abilities with a sqlite trigger:
-
-```sql
-CREATE TABLE IF NOT EXISTS ab_log_hist(ts TEXT, cid INT, model TEXT);
-CREATE TRIGGER ab_dis BEFORE UPDATE ON abilities
-WHEN OLD.enabled=1 AND NEW.enabled=0
-BEGIN INSERT INTO ab_log_hist VALUES(datetime('now'),OLD.channel_id,OLD.model); END;
-```
-
-## 2. new-api has no /v1/audio/generations route
-Music lives on the shim (`POST /v1/audio/generations`, Suno V5, 20 coins, ~40-60s sync).
-new-api returns 404 for that path. Run `pg_audio_gate.py` (127.0.0.1:8805): it validates
-the caller key against new-api `/v1/models` (cache 120s) then proxies to the shim.
-Caddy: `handle /v1/audio/generations { reverse_proxy 127.0.0.1:8805 }`.
-
-Gate pitfall: always read the request body before answering 401 and send
-`Connection: close`; otherwise the leftover body sticks to the keep-alive socket and the
+## 6. Local-to-remote stdin pipe delivers 0 bytes
+`cat file | ssh host 'cat > file'` (and base64/tr variants) writes a 0-byte file on this
+machine, which silently breaks `git push` with
+`remote: Invalid username or token`. Use `scp file host:/path` and verify with
+`wc -c` before relying on the content. the keep-alive socket and the
 next request becomes `{}POST /v1/audio/generations` -> 501 Unsupported method.
 
 ## 3. Balance must be refreshed, not trusted
